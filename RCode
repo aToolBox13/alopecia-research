@@ -1,0 +1,387 @@
+library(Seurat)
+library(SeuratObject)
+library(Matrix)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(nichenetr)
+
+data_dir <- "C:/Users/atulb/Downloads/Data"
+
+sample_folders <- list.dirs(data_dir, recursive = FALSE)
+
+seurat_list <- list()
+
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+
+# Loop over each sample folder
+for (sample_path in sample_folders) {
+
+  sample_name <- basename(sample_path)
+  cat("Processing:", sample_name, "\n")
+
+  files <- list.files(sample_path, full.names = TRUE)
+  matrix_file   <- files[grepl("matrix.*\\.mtx", files)]
+  features_file <- files[grepl("features.*\\.tsv", files)]
+  barcodes_file <- files[grepl("barcodes.*\\.tsv", files)]
+
+  counts <- readMM(gzfile(matrix_file))
+  genes  <- read.delim(gzfile(features_file), header = FALSE)
+  barcodes <- read.delim(gzfile(barcodes_file), header = FALSE)
+
+  # Map Ensembl IDs to HGNC symbols
+  gene_map <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"),
+                    filters = "ensembl_gene_id",
+                    values = genes$V1,
+                    mart = ensembl)
+
+  mapped_symbols <- gene_map$hgnc_symbol[match(genes$V1, gene_map$ensembl_gene_id)]
+  mapped_symbols[is.na(mapped_symbols) | mapped_symbols == ""] <- genes$V1[is.na(mapped_symbols) | mapped_symbols == ""]
+  mapped_symbols <- make.unique(mapped_symbols)
+
+  rownames(counts) <- mapped_symbols
+  colnames(counts) <- barcodes$V1
+
+  seurat_obj <- CreateSeuratObject(counts = counts)
+
+  seurat_obj <- NormalizeData(seurat_obj)
+  seurat_obj <- FindVariableFeatures(seurat_obj)
+  seurat_obj <- ScaleData(seurat_obj)
+
+  seurat_list[[sample_name]] <- seurat_obj
+
+  cat("Number of cells:", ncol(seurat_obj), "\n")
+  cat("Number of genes:", nrow(seurat_obj), "\n")
+  cat("Cells per cluster (initially all 1 cluster):\n")
+  print(table(Idents(seurat_obj)))
+  cat("\n------------------------\n")
+}
+
+# Integration across all 10 samples
+anchors <- FindIntegrationAnchors(object.list = seurat_list)
+integrated <- IntegrateData(anchors)
+
+saveRDS(integrated, file = "C:/Users/atulb/Downloads/Data/integrated_alopecia.rds")
+
+#MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+# Identifying Cell Type of Cluster 24
+#WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW
+expr_data <- GetAssayData(seurat_obj, assay = "RNA", slot = "data")
+
+ref <- BlueprintEncodeData()
+
+singleR_results <- SingleR(test = expr_data, ref = ref, labels = ref$label.main)
+
+seurat_obj$SingleR_labels <- singleR_results$labels
+
+cluster24_cells <- WhichCells(seurat_obj, idents = 24)
+
+cluster24_labels <- table(seurat_obj$SingleR_labels[cluster24_cells])
+print(cluster24_labels)
+
+fibro_markers <- list(
+  papillary = c("COL13A1", "PDPN", "FGF7"),
+  reticular = c("MFAP5", "MGP", "COL1A2"),
+  myofibroblast = c("ACTA2", "TAGLN", "MYH11"),
+  dermal = c("DCN", "LUM", "FBLN1")
+)
+
+cluster24_expr <- expr_data[, cluster24_cells]
+
+marker_scores <- sapply(fibro_markers, function(markers){
+  colMeans(cluster24_expr[markers, , drop = FALSE], na.rm = TRUE)
+})
+
+print(marker_scores)
+
+threshold <- 0.1
+subtype_assignment <- names(which.max(marker_scores))
+if(max(marker_scores) > threshold){
+  seurat_obj$Fibroblast_subtype[cluster24_cells] <- subtype_assignment
+} else {
+  seurat_obj$Fibroblast_subtype[cluster24_cells] <- NA
+}
+
+df_results <- data.frame(
+  cell = colnames(cluster24_expr),
+  broad_type = seurat_obj$SingleR_labels[cluster24_cells],
+  fibro_subtype = seurat_obj$Fibroblast_subtype[cluster24_cells]
+)
+
+head(df_results)
+
+#1. Average stress-gene heatmap across clusters (you already have this).
+#2. Volcano plot (Cluster 24 vs others).
+#3. Pathway enrichment dotplot of cluster 24 markers.
+#4. Module score UMAP + boxplot (shows per-cell/module signal).
+#5. Sender→Receiver bubble/interaction table showing which ligands could activate cluster 24.
+#6. Per-sample cluster 24 proportions (to show generalizability).
+
+DefaultAssay(integrated) <- "RNA"
+stress_genes <- c("HSPA5", "DDIT3", "ATF3", "GADD45B")
+
+# Extract expression data from Seurat object
+expr_data <- GetAssayData(seurat_obj, assay = "RNA", slot = "data")
+
+# Load reference dataset for broad cell type annotation
+ref <- BlueprintEncodeData()
+
+# Run SingleR on all cells
+singleR_results <- SingleR(test = expr_data, ref = ref, labels = ref$label.main)
+
+# Add SingleR broad cell type annotations to Seurat metadata
+seurat_obj$SingleR_labels <- singleR_results$labels
+
+# Identify cells in cluster 24
+cluster24_cells <- WhichCells(seurat_obj, idents = 24)
+
+# Check SingleR broad cell type labels for cluster 24
+cluster24_labels <- table(seurat_obj$SingleR_labels[cluster24_cells])
+print(cluster24_labels)
+# Expected output: mostly "Fibroblasts"
+
+# Define fibroblast subtype markers
+fibro_markers <- list(
+  papillary = c("COL13A1", "PDPN", "FGF7"),
+  reticular = c("MFAP5", "MGP", "COL1A2"),
+  myofibroblast = c("ACTA2", "TAGLN", "MYH11"),
+  dermal = c("DCN", "LUM", "FBLN1")
+)
+
+# Extract cluster 24 expression
+cluster24_expr <- expr_data[, cluster24_cells]
+
+marker_scores <- sapply(fibro_markers, function(markers){
+  colMeans(cluster24_expr[markers, , drop = FALSE], na.rm = TRUE)
+})
+
+print(marker_scores)
+
+threshold <- 0.1
+subtype_assignment <- names(which.max(marker_scores))
+if(max(marker_scores) > threshold){
+  seurat_obj$Fibroblast_subtype[cluster24_cells] <- subtype_assignment
+} else {
+  seurat_obj$Fibroblast_subtype[cluster24_cells] <- NA
+}
+
+df_results <- data.frame(
+  cell = colnames(cluster24_expr),
+  broad_type = seurat_obj$SingleR_labels[cluster24_cells],
+  fibro_subtype = seurat_obj$Fibroblast_subtype[cluster24_cells]
+)
+
+head(df_results)
+
+
+# MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+# 1. Average Stress Gene Expression Across Clusters
+# WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW
+
+stress_genes <- c("JUN", "JSP90AA1", "GADD45B", "HMOX1", "HSPA4L", "HSPA1A", "FOS", "HSP90AA1", "JUNB")
+
+DefaultAssay(integrated) <- "RNA"
+
+avg_expr <- AverageExpression(integrated, features = stress_genes, return.seurat = FALSE)$RNA
+
+col_order <- names(sort(colMeans(avg_expr), decreasing = TRUE))
+avg_expr <- avg_expr[, col_order]
+
+library(pheatmap)
+pheatmap(avg_expr,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         scale = "row",
+         main = "Average Stress Gene Expression Across Clusters")
+
+# MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+# 2. Volcano Plot: Cluster 24 vs All Other Clusters
+# WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW
+library(ggplot2)
+library(ggrepel)
+
+markers_cluster24$gene <- rownames(markers_cluster24)
+
+logfc_thresh <- 1
+pval_thresh <- 0.05
+
+markers_cluster24$color <- "Middle"
+markers_cluster24$color[markers_cluster24$avg_log2FC > logfc_thresh & markers_cluster24$p_val_adj < pval_thresh] <- "Up"
+markers_cluster24$color[markers_cluster24$avg_log2FC < -logfc_thresh & markers_cluster24$p_val_adj < pval_thresh] <- "Down"
+
+volcano <- ggplot(markers_cluster24, aes(x = avg_log2FC, y = -log10(p_val_adj), color = color)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = c("Up" = "red", "Down" = "blue", "Middle" = "grey")) +
+  geom_text_repel(
+    data = subset(markers_cluster24, color != "Middle" & abs(avg_log2FC) > 1.5),
+    aes(label = gene),
+    max.overlaps = 10,
+    size = 3
+  ) +
+  theme_minimal() +
+  theme(
+    aspect.ratio = 0.9,
+    panel.grid.major = element_line(color = "grey80", size = 0.5),
+    panel.grid.minor = element_line(color = "grey90", size = 0.25),
+    legend.position = "none"
+  ) +
+  labs(
+    title = "Volcano Plot: Cluster 24 vs All Other Clusters",
+    x = "log2 Fold Change",
+    y = "-log10 Adjusted P-value"
+  )
+
+print(volcano)
+
+# MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+# 3. Pathway Enrichment of Cluster 24 Markers
+# WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW
+integrated <- JoinLayers(integrated, assay = "RNA")
+
+Idents(integrated) <- "seurat_clusters"
+
+cluster24_markers <- FindMarkers(
+  integrated,
+  ident.1 = "24",
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+
+head(cluster24_markers)
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# Convert gene symbols to Entrez IDs
+genes <- rownames(cluster24_markers)[cluster24_markers$p_val_adj < 0.05]
+entrez_ids <- bitr(genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+# Run enrichment (GO Biological Process)
+ego <- enrichGO(
+  gene         = entrez_ids$ENTREZID,
+  OrgDb        = org.Hs.eg.db,
+  ont          = "BP",
+  pAdjustMethod= "BH",
+  qvalueCutoff = 0.05,
+  readable     = TRUE
+)
+
+dotplot(ego, showCategory = 20) + ggtitle("Pathway Enrichment of Cluster 24 Markers")
+
+# MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+# 4. Per-Cluster Stress Module Scores(True Values)
+# WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW
+library(Seurat)
+library(ggplot2)
+
+stress_genes <- list(
+  StressModule = c("JUN", "HSP90AA1", "GADD45B", "HMOX1", "HSPA4L", "HSPA1A", "FOS", "JUNB")
+)
+
+integrated <- AddModuleScore(
+  object = integrated,
+  features = stress_genes,
+  name = "StressModuleScore"
+)
+
+# This creates a new column in meta.data: StressModuleScore1
+
+UMAPPlot <- FeaturePlot(
+  integrated,
+  features = "StressModuleScore1",
+  cols = c("lightgrey", "red")
+) + ggtitle("Stress Module Score Across Cells")
+
+BoxPlot <- ggplot(integrated@meta.data, aes(x = seurat_clusters, y = StressModuleScore1)) +
+  geom_boxplot(fill = "salmon") +
+  theme_minimal() +
+  xlab("Cluster") + ylab("Stress Module Score") +
+  ggtitle("Per-Cluster Stress Module Scores") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(UMAPPlot)
+print(BoxPlot)
+
+# MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+# 5. Stress Ligand-Receptor Interactions in Cluster 24
+# WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW
+cells_24 <- WhichCells(integrated_sub, idents = 24)
+
+stress_genes_present <- c("JUN", "GADD45B", "HSPA1A", "FOS")
+expr_ligand <- GetAssayData(integrated_sub, assay = "RNA", slot = "data")[stress_genes_present, cells_24, drop = FALSE]
+
+receptors_of_interest <- c("NRP1", "NRP2", "EGFR", "TNFRSF1A")
+
+expr_receiver <- GetAssayData(integrated_sub, assay = "RNA", slot = "data")[receptors_of_interest, , drop = FALSE]
+
+avg_receiver <- colMeans(expr_receiver[, cells_24, drop = FALSE])
+
+avg_receiver_norm <- avg_receiver / length(cells_24)
+
+plot_df <- expand.grid(ligand = stress_genes_present, receptor = receptors_of_interest)
+plot_df$avg_expr <- sapply(1:nrow(plot_df), function(i) {
+  ligand <- plot_df$ligand[i]
+  receptor <- plot_df$receptor[i]
+  # normalize ligand expression by number of cells
+  ligand_expr <- mean(expr_ligand[ligand, ])
+  receptor_expr <- avg_receiver_norm[receptor]
+
+  ligand_expr * receptor_expr
+})
+
+ggplot(plot_df, aes(x = receptor, y = ligand)) +
+  geom_point(aes(size = avg_expr, color = avg_expr)) +
+  scale_color_viridis_c() +
+  theme_minimal() +
+  labs(title = "Stress Ligand-Receptor Interactions in Cluster 24",
+       x = "Receptor",
+       y = "Ligand",
+       size = "Interaction Strength",
+       color = "Interaction Strength")
+
+# MMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+# 6. Table of Generalizability
+# WWWWWWWWWWWWWWWWWWWWWWWWWWWWW
+stress_genes <- c("JUN", "GADD45B", "HSPA1A", "FOS")
+sample_dirs <- paste0("C:/Users/atulb/Downloads/Data/Sample", 1:10)
+sample_names <- paste0("Sample", 1:10)
+
+expr_percent_by_sample <- data.frame(Sample = sample_names,
+                                    JUN = NA, GADD45B = NA, HSPA1A = NA, FOS = NA)
+
+for (i in seq_along(sample_dirs)) {
+     matrix_file   <- list.files(sample_dirs[i], pattern = "matrix.mtx", full.names = TRUE)
+     features_file <- list.files(sample_dirs[i], pattern = "features.tsv", full.names = TRUE)
+
+     features <- read.delim(features_file, header = FALSE, stringsAsFactors = FALSE)
+     gene_idx <- which(features$V2 %in% stress_genes)
+     if(length(gene_idx) == 0) next
+
+     mat <- readMM(matrix_file)[gene_idx, , drop = FALSE]
+     rownames(mat) <- features$V2[gene_idx]
+
+     gene_sums <- Matrix::rowSums(mat)
+
+     expr_percent_by_sample[i, stress_genes] <- round(100 * gene_sums / sum(gene_sums), 1)
+ }
+
+ expr_percent_by_sample
+  expr <- data.frame(
+     Sample = paste0("Sample", 1:10),
+     JUN = c(12.6,15.5,17.3,17.3,20.6,23.0,20.9,13.2,18.1,26.4),
+     GADD45B = c(56.9,50.2,44.5,52.0,43.7,41.4,49.1,60.3,33.5,21.7),
+     HSPA1A = c(19.4,20.8,25.0,21.4,19.6,22.1,19.4,15.9,30.7,34.9),
+     FOS = c(11.1,13.5,13.2,9.4,16.2,13.5,10.6,10.6,17.7,17.0)
+ )
+
+ expr_percent <- expr
+ genes <- colnames(expr)[-1]
+ for(g in genes){
+     total <- sum(expr[[g]])
+     expr_percent[[g]] <- round(100 * expr[[g]] / total, 1)
+ }
+
+expr_percent
