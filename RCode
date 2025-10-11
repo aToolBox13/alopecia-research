@@ -17,7 +17,6 @@ seurat_list <- list()
 
 ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
 
-# Loop over each sample folder
 for (sample_path in sample_folders) {
 
   sample_name <- basename(sample_path)
@@ -32,7 +31,6 @@ for (sample_path in sample_folders) {
   genes  <- read.delim(gzfile(features_file), header = FALSE)
   barcodes <- read.delim(gzfile(barcodes_file), header = FALSE)
 
-  # Map Ensembl IDs to HGNC symbols
   gene_map <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"),
                     filters = "ensembl_gene_id",
                     values = genes$V1,
@@ -60,7 +58,6 @@ for (sample_path in sample_folders) {
   cat("\n------------------------\n")
 }
 
-# Integration across all 10 samples
 anchors <- FindIntegrationAnchors(object.list = seurat_list)
 integrated <- IntegrateData(anchors)
 
@@ -113,37 +110,29 @@ df_results <- data.frame(
 
 head(df_results)
 
-#1. Average stress-gene heatmap across clusters (you already have this).
-#2. Volcano plot (Cluster 24 vs others).
-#3. Pathway enrichment dotplot of cluster 24 markers.
-#4. Module score UMAP + boxplot (shows per-cell/module signal).
-#5. Sender→Receiver bubble/interaction table showing which ligands could activate cluster 24.
-#6. Per-sample cluster 24 proportions (to show generalizability).
+#1. Average stress-gene heatmap across clusters 
+#2. Volcano plot (Cluster 24 vs others)
+#3. Pathway enrichment dotplot of cluster 24 markers
+#4. Module score UMAP + boxplot (shows per-cell/module signal)
+#5. Sender-Receiver bubble/interaction table
+#6. Per-sample cluster 24 proportions
 
 DefaultAssay(integrated) <- "RNA"
 stress_genes <- c("HSPA5", "DDIT3", "ATF3", "GADD45B")
 
-# Extract expression data from Seurat object
 expr_data <- GetAssayData(seurat_obj, assay = "RNA", slot = "data")
 
-# Load reference dataset for broad cell type annotation
 ref <- BlueprintEncodeData()
 
-# Run SingleR on all cells
 singleR_results <- SingleR(test = expr_data, ref = ref, labels = ref$label.main)
 
-# Add SingleR broad cell type annotations to Seurat metadata
 seurat_obj$SingleR_labels <- singleR_results$labels
 
-# Identify cells in cluster 24
 cluster24_cells <- WhichCells(seurat_obj, idents = 24)
 
-# Check SingleR broad cell type labels for cluster 24
 cluster24_labels <- table(seurat_obj$SingleR_labels[cluster24_cells])
 print(cluster24_labels)
-# Expected output: mostly "Fibroblasts"
 
-# Define fibroblast subtype markers
 fibro_markers <- list(
   papillary = c("COL13A1", "PDPN", "FGF7"),
   reticular = c("MFAP5", "MGP", "COL1A2"),
@@ -151,7 +140,6 @@ fibro_markers <- list(
   dermal = c("DCN", "LUM", "FBLN1")
 )
 
-# Extract cluster 24 expression
 cluster24_expr <- expr_data[, cluster24_cells]
 
 marker_scores <- sapply(fibro_markers, function(markers){
@@ -255,11 +243,9 @@ head(cluster24_markers)
 library(clusterProfiler)
 library(org.Hs.eg.db)
 
-# Convert gene symbols to Entrez IDs
 genes <- rownames(cluster24_markers)[cluster24_markers$p_val_adj < 0.05]
 entrez_ids <- bitr(genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
 
-# Run enrichment (GO Biological Process)
 ego <- enrichGO(
   gene         = entrez_ids$ENTREZID,
   OrgDb        = org.Hs.eg.db,
@@ -286,8 +272,6 @@ integrated <- AddModuleScore(
   features = stress_genes,
   name = "StressModuleScore"
 )
-
-# This creates a new column in meta.data: StressModuleScore1
 
 UMAPPlot <- FeaturePlot(
   integrated,
@@ -325,7 +309,7 @@ plot_df <- expand.grid(ligand = stress_genes_present, receptor = receptors_of_in
 plot_df$avg_expr <- sapply(1:nrow(plot_df), function(i) {
   ligand <- plot_df$ligand[i]
   receptor <- plot_df$receptor[i]
-  # normalize ligand expression by number of cells
+
   ligand_expr <- mean(expr_ligand[ligand, ])
   receptor_expr <- avg_receiver_norm[receptor]
 
